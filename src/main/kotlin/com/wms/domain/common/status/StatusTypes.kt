@@ -289,3 +289,37 @@ sealed class InboundOrderStatus(
         )
     }
 }
+
+sealed class OutboundOrderStatus(
+    val code: String,
+    val displayName: String
+) {
+    data object Pending : OutboundOrderStatus("PENDING", "출고대기")
+    data object Allocated : OutboundOrderStatus("ALLOCATED", "할당완료")
+    data object Picking : OutboundOrderStatus("PICKING", "피킹중")
+    data object Picked : OutboundOrderStatus("PICKED", "피킹완료")
+    data object Packed : OutboundOrderStatus("PACKED", "패킹완료")
+    data object Shipped : OutboundOrderStatus("SHIPPED", "출고완료")
+    data object Cancelled : OutboundOrderStatus("CANCELLED", "취소됨")
+    data object Deallocated : OutboundOrderStatus("DEALLOCATED", "할당취소")
+    data object PickShortage : OutboundOrderStatus("PICK_SHORTAGE", "피킹부족")
+    
+    companion object {
+        fun fromCode(code: String): OutboundOrderStatus = when (code) {
+            "PENDING" -> Pending
+            "ALLOCATED" -> Allocated
+            "PICKING" -> Picking
+            "PICKED" -> Picked
+            "PACKED" -> Packed
+            "SHIPPED" -> Shipped
+            "CANCELLED" -> Cancelled
+            "DEALLOCATED" -> Deallocated
+            "PICK_SHORTAGE" -> PickShortage
+            else -> throw IllegalArgumentException("Unknown OutboundOrderStatus: $code")
+        }
+        
+        fun all(): List<OutboundOrderStatus> = listOf(
+            Pending, Allocated, Picking, Picked, Packed, Shipped, Cancelled, Deallocated, PickShortage
+        )
+    }
+}

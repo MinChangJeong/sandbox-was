@@ -261,3 +261,31 @@ sealed class InventoryStatus(
         )
     }
 }
+
+sealed class InboundOrderStatus(
+    val code: String,
+    val displayName: String
+) {
+    data object Expected : InboundOrderStatus("EXPECTED", "입고예상")
+    data object Inspecting : InboundOrderStatus("INSPECTING", "검수중")
+    data object Inspected : InboundOrderStatus("INSPECTED", "검수완료")
+    data object PutawayInProgress : InboundOrderStatus("PUTAWAY_IN_PROGRESS", "적치진행중")
+    data object Completed : InboundOrderStatus("COMPLETED", "입고완료")
+    data object Rejected : InboundOrderStatus("REJECTED", "거절됨")
+    
+    companion object {
+        fun fromCode(code: String): InboundOrderStatus = when (code) {
+            "EXPECTED" -> Expected
+            "INSPECTING" -> Inspecting
+            "INSPECTED" -> Inspected
+            "PUTAWAY_IN_PROGRESS" -> PutawayInProgress
+            "COMPLETED" -> Completed
+            "REJECTED" -> Rejected
+            else -> throw IllegalArgumentException("Unknown InboundOrderStatus: $code")
+        }
+        
+        fun all(): List<InboundOrderStatus> = listOf(
+            Expected, Inspecting, Inspected, PutawayInProgress, Completed, Rejected
+        )
+    }
+}

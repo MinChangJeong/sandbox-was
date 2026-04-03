@@ -691,6 +691,8 @@ class InventoryQueryController(
 ### 3.6 동시성 제어 (Concurrency Control)
 
 > **재고 시스템의 핵심**: 여러 작업자가 동시에 같은 SKU를 할당할 때 경합 해결
+>
+> ⚠️ **IMPORTANT**: Pessimistic Lock 쿼리 작성 시 Section 3.8의 Entity-Query 호환성 규칙 반드시 준수
 
 #### 3.4.1 락 전략
 
@@ -941,6 +943,361 @@ class InventoryEventHandler {
         // 트랜잭션 커밋 후 실행이 필요한 작업
     }
 }
+```
+
+---
+
+## 3.8 Entity-Query 호환성 규칙 (Compile-Time 검증)
+
+> ⚠️ **CRITICAL**: Kotlin + JPA 조합에서 발생하는 런타임 오류를 컴파일 타임에 방지하기 위한 필수 규칙
+
+### 3.8.1 Private Backing Field와 JPQL 호환성
+
+#### ❌ WRONG: Private Backing Field with Getter
+```kotlin
+@Entity
+class Inventory : AggregateRoot() {
+    
+    @Column(name = "quantity")
+    private var _quantity: Int = 0
+    
+    @Column(name = "status")
+    private var _status: InventoryStatus = InventoryStatus.Available
+    
+    // Public getter 제공
+    val quantity: Int get() = _quantity
+    val status: InventoryStatus get() = _status
+    
+    // ❌ JPQL에서 접근 불가!
+    // PathElementException: Could not resolve attribute 'quantity'
+}
+
+// ❌ 같은 파일에서 @Query 작성 불가:
+@Query("SELECT i FROM Inventory i WHERE (i.quantity - i.allocatedQty) > 0")
+fun findAllocatable(): List<Inventory>
+```
+
+**왜 문제인가?**
+- Kotlin 컴파일러: "문법 OK" ✅
+- Gradle build: "OK" ✅
+- Spring Bean 초기화: "private field 'quantity'를 찾을 수 없음" ❌ (너무 늦음)
+- JPQL은 `private var _quantity`를 접근할 수 없음
+- `val quantity: Int get()`은 JPQL 관점에서 존재하지 않는 필드
+
+#### ✅ CORRECT: Option 1 - Public Field with Domain Methods
+```kotlin
+@Entity
+class Inventory : AggregateRoot() {
+    
+    @Column(name = "quantity")
+    val quantity: Int = 0  // Public, JPQL 접근 가능
+    
+    @Column(name = "allocated_qty")
+    private var _allocatedQty: Int = 0
+    
+    @Convert(converter = InventoryStatusConverter::class)
+    @Column(name = "status")
+    val status: InventoryStatus = InventoryStatus.Available  // Public
+    
+    // ✅ 값 변경은 도메인 메서드로만
+    fun allocate(qty: Int, orderId: Long) {
+        require(availableQty >= qty) { "부족" }
+        _allocatedQty += qty
+        // ...
+    }
+    
+    // ✅ 이제 @Query에서 접근 가능
+    val availableQty: Int get() = quantity - _allocatedQty
+}
+
+// ✅ 쿼리 성공
+@Query("SELECT i FROM Inventory i WHERE (i.quantity - i.allocatedQty) > 0")
+fun findAllocatable(): List<Inventory>
+```
+
+**장점:**
+- JPQL에서 직접 접근 가능
+- Compile 시점에 문제 없음
+- 도메인 메서드로 값 변경 강제
+
+#### ✅ CORRECT: Option 2 - Read-Only Public Field
+```kotlin
+@Entity
+class Inventory : AggregateRoot() {
+    
+    @Column(name = "quantity", updatable = false, insertable = false)
+    val quantity: Int = 0  // 읽기 전용
+    
+    // 초기화 시에만 설정 가능
+    constructor(quantity: Int) : this() {
+        // ... 초기 설정 로직
+    }
+}
+```
+
+---
+
+### 3.8.2 Computed Property와 @Transient
+
+#### ❌ WRONG: @Query에서 Computed Property 사용
+```kotlin
+@Entity
+class Inventory : AggregateRoot() {
+    
+    @Column(name = "quantity")
+    val quantity: Int = 0
+    
+    @Column(name = "allocated_qty")
+    val allocatedQty: Int = 0
+    
+    // ❌ DB 컬럼이 없는데 @Query에서 사용하면 오류
+    val availableQty: Int get() = quantity - allocatedQty
+}
+
+// ❌ 실패 (availableQty는 DB 컬럼이 아님)
+@Query("SELECT i FROM Inventory i WHERE i.availableQty > 0")
+fun findWithAvailable(): List<Inventory>
+```
+
+#### ✅ CORRECT: @Transient + Query에서 제외
+```kotlin
+@Entity
+class Inventory : AggregateRoot() {
+    
+    @Column(name = "quantity")
+    val quantity: Int = 0
+    
+    @Column(name = "allocated_qty")
+    val allocatedQty: Int = 0
+    
+    // ✅ @Transient 필수 (DB에 저장 안 함)
+    @Transient
+    val availableQty: Int get() = quantity - allocatedQty
+}
+
+// ✅ 올바른 방법: 실제 DB 컬럼 사용
+@Query("SELECT i FROM Inventory i WHERE (i.quantity - i.allocatedQty) > 0")
+fun findWithAvailable(): List<Inventory>
+```
+
+**규칙**: Computed property는 @Transient로 명시 + 절대 @Query에서 직접 참조 금지
+
+---
+
+### 3.8.3 Repository @Query 파라미터 검증 체크리스트
+
+#### ❌ WRONG: Method와 @Query 파라미터 불일치
+```kotlin
+// ❌ warehouseId 파라미터가 @Query에 없음
+@Query("""
+    SELECT i FROM Inventory i 
+    WHERE i.itemId = :itemId 
+    AND i.locationId = :locationId
+    AND i.status = :status
+""")
+fun searchWithCriteria(
+    @Param("itemId") itemId: Long?,
+    @Param("locationId") locationId: Long?,
+    @Param("warehouseId") warehouseId: Long?,  // ← @Query에 없음!
+    @Param("status") status: String?,
+    pageable: Pageable
+): Page<Inventory>
+
+// Result: IllegalStateException at Spring startup
+// "parameter 'Optional[warehouseId]' not found in annotated query"
+```
+
+#### ✅ CORRECT: 파라미터 완전 일치
+```kotlin
+// ✅ @Query의 모든 :paramName이 메서드의 @Param과 일치
+@Query("""
+    SELECT i FROM Inventory i 
+    WHERE i.itemId = :itemId 
+    AND i.locationId = :locationId
+    AND i.status = :status
+""")
+fun searchWithCriteria(
+    @Param("itemId") itemId: Long?,
+    @Param("locationId") locationId: Long?,
+    @Param("status") status: String?,
+    pageable: Pageable
+): Page<Inventory>
+```
+
+#### @Query 작성 필수 체크리스트
+```
+매번 @Query 메서드 작성 후 반드시 확인:
+
+[ ] @Query의 모든 :paramName이 메서드의 @Param에 있는가?
+[ ] 메서드의 @Param이 모두 @Query에서 사용되는가?
+[ ] 파라미터 개수가 정확히 일치하는가? (count both sides)
+[ ] 파라미터 타입이 일치하는가? (Long vs String vs InventoryStatus)
+[ ] IDE의 type checker가 오류를 지적하는가? → 즉시 수정
+```
+
+---
+
+### 3.8.4 JPQL vs Native SQL 선택 기준
+
+| 상황 | JPQL | Native SQL | 이유 |
+|------|------|-----------|------|
+| Entity 필드만 참조 | ✅ | ⚠️ | JPQL이 타입 안전 |
+| Private backing field 참조 | ❌ | ❌ | 둘 다 불가 (Entity 설계 수정 필요) |
+| Computed property 참조 | ❌ | ❌ | DB 컬럼이 없음 |
+| DB 함수 (GROUP_CONCAT 등) | ❌ | ✅ | JPQL은 표준 함수만 지원 |
+| 복잡한 조인 | ⚠️ | ✅ | JPQL도 가능하지만 Native가 간단 |
+| 성능 최적화 필요 | ⚠️ | ✅ | DB-specific optimization |
+
+#### ❌ NEVER: Private Backing Field + Native SQL
+```kotlin
+// ❌ 절대 금지 (Native SQL도 backing field 접근 불가)
+@Query(nativeQuery = true, value = """
+    SELECT * FROM inventories 
+    WHERE _quantity > 0  // ← DB 컬럼명은 quantity, _quantity 아님!
+""")
+fun findWithStock(): List<Inventory>
+```
+
+#### ✅ CORRECT: Native SQL은 정확한 컬럼명 사용
+```kotlin
+// ✅ 컬럼명 사용 (Entity의 @Column 참고)
+@Query(nativeQuery = true, value = """
+    SELECT * FROM inventories i
+    WHERE (i.quantity - i.allocated_qty) > 0
+    ORDER BY i.created_at ASC
+""")
+fun findAllocatable(@Param("itemId") itemId: Long): List<Inventory>
+```
+
+---
+
+### 3.8.5 Adapter와 Repository 메서드 호출 검증
+
+#### ❌ WRONG: Adapter에서 잘못된 인자 전달
+```kotlin
+// Repository 정의
+@Query("SELECT i FROM Inventory i WHERE i.itemId = :itemId ...")
+fun search(
+    @Param("itemId") itemId: Long?,
+    @Param("status") status: String?
+): List<Inventory>
+
+// Adapter (❌ 잘못된 호출)
+class InventoryRepositoryAdapter {
+    fun search(itemId: Long?, status: String?, warehouseId: Long?) {
+        return jpaRepository.search(
+            itemId = itemId,
+            status = status,
+            warehouseId = warehouseId  // ← 메서드에 없는 파라미터!
+        )
+    }
+}
+```
+
+#### ✅ CORRECT: Adapter와 Repository 메서드 서명 일치
+```kotlin
+// Repository
+@Query("SELECT i FROM Inventory i WHERE i.itemId = :itemId ...")
+fun search(
+    @Param("itemId") itemId: Long?,
+    @Param("status") status: String?
+): List<Inventory>
+
+// Adapter (✅ 정확히 일치)
+class InventoryRepositoryAdapter {
+    fun search(itemId: Long?, status: String?): List<Inventory> {
+        return jpaRepository.search(itemId, status)
+    }
+}
+```
+
+---
+
+### 3.8.6 Compile-Time 검증 도구
+
+#### 현재 상태
+- ✅ Kotlin 컴파일러: 문법 검증 (하지만 @Query는 검증 안 함)
+- ✅ Gradle build: 컴파일만 (쿼리 검증 안 함)
+- ❌ Spring startup: 너무 늦게 검증 (bootRun 실패)
+
+#### 개선 로드맵
+
+| 단계 | 기술 | 기간 | 영향 |
+|------|------|------|------|
+| **즉시** | Entity 설계 규칙 강제 | 이미 진행 | 런타임 오류 50% 감소 |
+| **단기** | Gradle Query Validation Plugin 검토 | 1-2주 | 조기 검증 (build 단계) |
+| **중기** | QueryDSL 또는 Jooq 도입 | Phase 3 | Type-safe queries |
+| **장기** | Spring AOT Compilation | Phase 4+ | Compile-time 완전 검증 |
+
+#### 즉시 가능한 Pre-flight Validation
+```kotlin
+// src/main/kotlin/com/wms/config/QueryValidationPostProcessor.kt
+@Component
+class QueryValidationPostProcessor : BeanPostProcessor {
+    
+    override fun postProcessBeforeInitialization(bean: Any, beanName: String): Any? {
+        if (bean is JpaRepository) {
+            logger.info("Validating @Query methods for $beanName...")
+            // Spring이 Bean 생성할 때 자동으로 @Query 검증
+            // 오류가 있으면 즉시 실패
+        }
+        return bean
+    }
+}
+```
+
+---
+
+### 3.8.7 Testing: @Query 검증 테스트
+
+#### 필수 테스트 (testing.md에도 추가 필요)
+```kotlin
+@SpringBootTest
+class RepositoryQueryValidationTest {
+    
+    @Test
+    fun `Entity fields must be public or @Column mapped for JPQL` { }
+    
+    @Test
+    fun `@Query parameters must match method signature` { }
+    
+    @Test
+    fun `Computed properties must be @Transient` { }
+    
+    @Test
+    fun `Parameter types must match between @Param and method` { }
+    
+    @Test
+    fun `Native SQL queries must use actual DB column names` { }
+}
+```
+
+---
+
+### 3.8.8 Common Pitfalls (실제 Phase 2 오류들)
+
+#### Pitfall 1: Private Backing Field with Public Getter
+```
+발생: Phase 2, InventoryJpaRepository line 26
+원인: JPQL에서 private var _quantity 접근 시도
+오류: PathElementException: Could not resolve attribute 'quantity'
+해결: Entity 설계 재검토 (Section 3.8.1 참고)
+```
+
+#### Pitfall 2: Computed Property in @Query
+```
+발생: Phase 2, InventoryJpaRepository line 41
+원인: i.status (private field) JPQL에서 접근 시도
+오류: PathElementException: Could not resolve attribute 'status'
+해결: Native SQL로 변경 또는 Entity 설계 수정
+```
+
+#### Pitfall 3: Method-Query Parameter Mismatch
+```
+발생: Phase 2, InventoryRepositoryAdapter line 60
+원인: warehouseId 파라미터가 @Query에 없음
+오류: IllegalStateException: parameter not found in annotated query
+해결: 메서드 시그니처 정리 및 체크리스트 사용
 ```
 
 ---

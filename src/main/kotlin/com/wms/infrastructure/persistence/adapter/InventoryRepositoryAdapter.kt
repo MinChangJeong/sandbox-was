@@ -5,6 +5,7 @@ import com.wms.domain.inventory.repository.InventoryRepository
 import com.wms.domain.inventory.repository.InventoryHistoryRepository
 import com.wms.infrastructure.persistence.mapper.InventoryMapper
 import com.wms.infrastructure.persistence.repository.InventoryJpaRepository
+import com.wms.infrastructure.logging.EventPublisher
 import org.springframework.data.domain.Page
 import org.springframework.data.domain.Pageable
 import org.springframework.stereotype.Repository
@@ -13,7 +14,8 @@ import org.springframework.stereotype.Repository
 class InventoryRepositoryAdapter(
     private val jpaRepository: InventoryJpaRepository,
     private val mapper: InventoryMapper,
-    private val historyRepository: InventoryHistoryRepository
+    private val historyRepository: InventoryHistoryRepository,
+    private val eventPublisher: EventPublisher
 ) : InventoryRepository {
     
     override fun findById(id: Long): Inventory? {
@@ -76,6 +78,10 @@ class InventoryRepositoryAdapter(
         
         // ✅ 재고 변경 이력 영속화 (Domain이 recordHistory()로 기록한 모든 이력)
         persistInventoryHistories(savedDomain)
+        
+        // ✅ 도메인 이벤트 발행
+        publishDomainEvents(savedDomain)
+        
         return savedDomain
     }
     
@@ -84,6 +90,13 @@ class InventoryRepositoryAdapter(
         if (histories.isNotEmpty()) {
             historyRepository.saveAll(histories)
         }
+    }
+    
+    private fun publishDomainEvents(inventory: Inventory) {
+        inventory.domainEvents.forEach { event ->
+            eventPublisher.publish(event)
+        }
+        inventory.clearDomainEvents()
     }
     
     override fun saveAll(inventories: List<Inventory>): List<Inventory> {

@@ -4,6 +4,7 @@ import com.wms.domain.common.AggregateRoot
 import com.wms.domain.common.status.InventoryStatus
 import com.wms.domain.inventory.event.InventoryAllocatedEvent
 import com.wms.domain.inventory.event.InventoryDeallocatedEvent
+import com.wms.domain.inventory.event.InventoryHistoryRecordedEvent
 import jakarta.persistence.*
 import java.time.LocalDateTime
 
@@ -45,19 +46,10 @@ class Inventory private constructor(
     @Transient
     private var _histories: MutableList<InventoryHistory> = mutableListOf(),
     
-    @Column(name = "created_at", nullable = false, updatable = false)
     override val createdAt: LocalDateTime = LocalDateTime.now(),
-    
-    @Column(name = "created_by", nullable = false, updatable = false)
     override var createdBy: String = "",
-    
-    @Column(name = "updated_at", nullable = false)
     override var updatedAt: LocalDateTime = LocalDateTime.now(),
-    
-    @Column(name = "updated_by", nullable = false)
     override var updatedBy: String = "",
-    
-    @Column(name = "is_deleted", nullable = false)
     override var isDeleted: Boolean = false
 ) : AggregateRoot() {
     
@@ -86,6 +78,22 @@ class Inventory private constructor(
                 _status = InventoryStatus.Available,
                 createdBy = createdBy,
                 updatedBy = createdBy
+            )
+        }
+    }
+    
+    /**
+     * 초기 재고 기록 (ID가 할당된 후 호출)
+     * Adapter가 DB 저장 후 호출하므로 this.id가 유효함
+     */
+    internal fun recordInitialStockHistory(createdBy: String) {
+        if (quantity > 0) {
+            recordHistoryAndPublishEvent(
+                transactionType = "INITIAL_STOCK",
+                changeQuantity = quantity,
+                beforeQuantity = 0,
+                reason = "초기 재고 설정",
+                createdBy = createdBy
             )
         }
     }
@@ -185,92 +193,96 @@ class Inventory private constructor(
         )
     }
     
-    /**
-     * 재고 할당 (출고 오더 할당)
-     */
-    fun allocate(
-        quantity: Int,
-        orderId: Long,
-        updatedBy: String
-    ) {
-        require(quantity > 0) { "할당 수량은 1 이상이어야 합니다" }
-        require(availableQty >= quantity) { 
-            "가용재고 부족: 요청=$quantity, 가용=${availableQty}"
-        }
-        require(_status.canAllocate()) { "할당 불가 상태: ${_status.displayName}" }
-        
-        val beforeAllocatedQty = _allocatedQty
-        _allocatedQty += quantity
-        
-        // 상태 전이: 전량 할당되면 FullyAllocated
-        if (availableQty == 0) {
-            _status = InventoryStatus.FullyAllocated
-        } else if (availableQty < _quantity) {
-            _status = InventoryStatus.Allocated
-        }
-        
-        updatedAt = LocalDateTime.now()
-        this.updatedBy = updatedBy
-        
-        recordHistory(
-            transactionType = "ALLOCATE",
-            changeQuantity = quantity,
-            beforeQuantity = beforeAllocatedQty,
-            reason = "출고 할당",
-            referenceType = "OUTBOUND_ORDER",
-            referenceId = orderId,
-            createdBy = updatedBy
-        )
-        
-        registerEvent(InventoryAllocatedEvent(
-            inventoryId = this.id,
-            allocatedQty = quantity,
-            orderId = orderId,
-            aggregateId = this.id
-        ))
-    }
+     /**
+      * 재고 할당 (출고 오더 할당)
+      * 규칙 1 준수: quantity는 변경 안 하고 allocatedQty만 변경
+      * - changeQuantity = 0 (quantity 불변)
+      * - allocatedQtyBefore/After로 할당 변화 기록
+      */
+     fun allocate(
+         quantity: Int,
+         orderId: Long,
+         updatedBy: String
+     ) {
+         require(quantity > 0) { "할당 수량은 1 이상이어야 합니다" }
+         require(availableQty >= quantity) { 
+             "가용재고 부족: 요청=$quantity, 가용=${availableQty}"
+         }
+         require(_status.canAllocate()) { "할당 불가 상태: ${_status.displayName}" }
+         
+         val beforeAllocatedQty = _allocatedQty
+         _allocatedQty += quantity
+         
+         if (availableQty == 0) {
+             _status = InventoryStatus.FullyAllocated
+         } else if (availableQty < _quantity) {
+             _status = InventoryStatus.Allocated
+         }
+         
+         updatedAt = LocalDateTime.now()
+         this.updatedBy = updatedBy
+         
+         recordHistoryForAllocation(
+             transactionType = "ALLOCATE",
+             allocatedQtyBefore = beforeAllocatedQty,
+             allocatedQtyAfter = _allocatedQty,
+             reason = "출고 할당",
+             referenceType = "OUTBOUND_ORDER",
+             referenceId = orderId,
+             createdBy = updatedBy
+         )
+         
+         registerEvent(InventoryAllocatedEvent(
+             inventoryId = this.id,
+             allocatedQty = quantity,
+             orderId = orderId,
+             aggregateId = this.id
+         ))
+     }
     
-    /**
-     * 재고 할당 해제
-     */
-    fun deallocate(
-        quantity: Int,
-        reason: String,
-        updatedBy: String
-    ) {
-        require(quantity > 0) { "할당 해제 수량은 1 이상이어야 합니다" }
-        require(_allocatedQty >= quantity) { 
-            "할당된 수량 부족: 요청=$quantity, 할당=${_allocatedQty}"
-        }
-        
-        val beforeAllocatedQty = _allocatedQty
-        _allocatedQty -= quantity
-        
-        // 상태 복원
-        if (_allocatedQty == 0) {
-            _status = InventoryStatus.Available
-        } else if (_status == InventoryStatus.FullyAllocated) {
-            _status = InventoryStatus.Allocated
-        }
-        
-        updatedAt = LocalDateTime.now()
-        this.updatedBy = updatedBy
-        
-        recordHistory(
-            transactionType = "DEALLOCATE",
-            changeQuantity = -quantity,
-            beforeQuantity = beforeAllocatedQty,
-            reason = reason,
-            createdBy = updatedBy
-        )
-        
-        registerEvent(InventoryDeallocatedEvent(
-            inventoryId = this.id,
-            deallocatedQty = quantity,
-            reason = reason,
-            aggregateId = this.id
-        ))
-    }
+     /**
+      * 재고 할당 해제
+      * 규칙 1 준수: quantity는 변경 안 하고 allocatedQty만 변경
+      * - changeQuantity = 0 (quantity 불변)
+      * - allocatedQtyBefore/After로 할당 변화 기록
+      */
+     fun deallocate(
+         quantity: Int,
+         reason: String,
+         updatedBy: String
+     ) {
+         require(quantity > 0) { "할당 해제 수량은 1 이상이어야 합니다" }
+         require(_allocatedQty >= quantity) { 
+             "할당된 수량 부족: 요청=$quantity, 할당=${_allocatedQty}"
+         }
+         
+         val beforeAllocatedQty = _allocatedQty
+         _allocatedQty -= quantity
+         
+         if (_allocatedQty == 0) {
+             _status = InventoryStatus.Available
+         } else if (_status == InventoryStatus.FullyAllocated) {
+             _status = InventoryStatus.Allocated
+         }
+         
+         updatedAt = LocalDateTime.now()
+         this.updatedBy = updatedBy
+         
+         recordHistoryForAllocation(
+             transactionType = "DEALLOCATE",
+             allocatedQtyBefore = beforeAllocatedQty,
+             allocatedQtyAfter = _allocatedQty,
+             reason = reason,
+             createdBy = updatedBy
+         )
+         
+         registerEvent(InventoryDeallocatedEvent(
+             inventoryId = this.id,
+             deallocatedQty = quantity,
+             reason = reason,
+             aggregateId = this.id
+         ))
+     }
     
     /**
      * 재고 이동 (출발지)
@@ -324,12 +336,109 @@ class Inventory private constructor(
             referenceType = "MOVEMENT",
             referenceId = fromLocationId,
             createdBy = updatedBy
-        )
-    }
-    
-    /**
-     * 상태 변경
-     */
+         )
+     }
+     
+     fun transferToZone(
+         quantity: Int,
+         toZoneId: Long,
+         reason: String,
+         updatedBy: String
+     ) {
+         require(quantity > 0) { "이동 수량은 1 이상이어야 합니다" }
+         require(availableQty >= quantity) {
+             "가용재고 부족: 요청=$quantity, 가용=${availableQty}"
+         }
+         
+         val beforeQty = _quantity
+         _quantity -= quantity
+         updatedAt = LocalDateTime.now()
+         this.updatedBy = updatedBy
+         
+         recordHistory(
+             transactionType = "TRANSFER_OUT",
+             changeQuantity = -quantity,
+             beforeQuantity = beforeQty,
+             reason = reason,
+             referenceType = "ZONE",
+             referenceId = toZoneId,
+             createdBy = updatedBy
+         )
+     }
+     
+     fun receiveFromTransfer(
+         quantity: Int,
+         fromZoneId: Long,
+         reason: String,
+         updatedBy: String
+     ) {
+         require(quantity > 0) { "이동 수량은 1 이상이어야 합니다" }
+         
+         val beforeQty = _quantity
+         _quantity += quantity
+         updatedAt = LocalDateTime.now()
+         this.updatedBy = updatedBy
+         
+         recordHistory(
+             transactionType = "TRANSFER_IN",
+             changeQuantity = quantity,
+             beforeQuantity = beforeQty,
+             reason = reason,
+             referenceType = "ZONE",
+             referenceId = fromZoneId,
+             createdBy = updatedBy
+         )
+     }
+     
+     fun performCycleCounting(
+         actualQuantity: Int,
+         reason: String,
+         updatedBy: String
+     ) {
+         require(actualQuantity >= 0) { "실사 수량은 0 이상이어야 합니다" }
+         
+         val beforeQty = _quantity
+         val difference = actualQuantity - _quantity
+         _quantity = actualQuantity
+         updatedAt = LocalDateTime.now()
+         this.updatedBy = updatedBy
+         
+         recordHistory(
+             transactionType = "CYCLE_COUNT",
+             changeQuantity = difference,
+             beforeQuantity = beforeQty,
+             reason = reason,
+             createdBy = updatedBy
+         )
+     }
+     
+     fun addReturnInbound(
+         quantity: Int,
+         returnOrderId: Long,
+         reason: String,
+         updatedBy: String
+     ) {
+         require(quantity > 0) { "반품 수량은 1 이상이어야 합니다" }
+         
+         val beforeQty = _quantity
+         _quantity += quantity
+         updatedAt = LocalDateTime.now()
+         this.updatedBy = updatedBy
+         
+         recordHistory(
+             transactionType = "RETURN_INBOUND",
+             changeQuantity = quantity,
+             beforeQuantity = beforeQty,
+             reason = reason,
+             referenceType = "RETURN_ORDER",
+             referenceId = returnOrderId,
+             createdBy = updatedBy
+         )
+     }
+     
+     /**
+      * 상태 변경
+      */
     fun transitionTo(
         newStatus: InventoryStatus,
         reason: String,
@@ -353,33 +462,112 @@ class Inventory private constructor(
         )
     }
     
-    /**
-     * 이력 기록 (내부 사용)
-     */
-    internal fun recordHistory(
-        transactionType: String,
-        changeQuantity: Int,
-        beforeQuantity: Int,
-        reason: String? = null,
-        referenceType: String? = null,
-        referenceId: Long? = null,
-        createdBy: String
-    ) {
-        val history = InventoryHistory.create(
-            inventoryId = this.id,
-            transactionType = transactionType,
-            changeQuantity = changeQuantity,
-            beforeQuantity = beforeQuantity,
-            afterQuantity = beforeQuantity + changeQuantity,
-            referenceType = referenceType,
-            referenceId = referenceId,
-            reason = reason,
-            createdBy = createdBy
-        )
-        _histories.add(history)
-    }
+     /**
+      * 이력 기록 및 이벤트 발행 (규칙 1: Tell, Don't Ask 준수)
+      * - Domain이 스스로 이력을 기록
+      * - Event를 발행하여 Infrastructure가 처리하도록 위임
+      */
+     private fun recordHistoryAndPublishEvent(
+         transactionType: String,
+         changeQuantity: Int,
+         beforeQuantity: Int,
+         reason: String? = null,
+         referenceType: String? = null,
+         referenceId: Long? = null,
+         createdBy: String
+     ) {
+         val afterQuantity = beforeQuantity + changeQuantity
+         
+         val history = InventoryHistory.create(
+             inventoryId = this.id,
+             transactionType = transactionType,
+             changeQuantity = changeQuantity,
+             beforeQuantity = beforeQuantity,
+             afterQuantity = afterQuantity,
+             referenceType = referenceType,
+             referenceId = referenceId,
+             reason = reason,
+             createdBy = createdBy
+         )
+         _histories.add(history)
+         
+         registerEvent(InventoryHistoryRecordedEvent(
+             aggregateId = this.id,
+             inventoryId = this.id,
+             transactionType = transactionType,
+             changeQuantity = changeQuantity,
+             beforeQuantity = beforeQuantity,
+             afterQuantity = afterQuantity,
+             referenceType = referenceType,
+             referenceId = referenceId,
+             reason = reason,
+             createdBy = createdBy
+         ))
+     }
     
-    fun getHistories(): List<InventoryHistory> = _histories.toList()
+     /**
+      * 이력 기록 (내부 사용)
+      * 규칙 1 준수: Event를 통해 Infrastructure에 위임
+      */
+      internal fun recordHistory(
+          transactionType: String,
+          changeQuantity: Int,
+          beforeQuantity: Int,
+          reason: String? = null,
+          referenceType: String? = null,
+          referenceId: Long? = null,
+          createdBy: String
+      ) {
+          recordHistoryAndPublishEvent(
+              transactionType = transactionType,
+              changeQuantity = changeQuantity,
+              beforeQuantity = beforeQuantity,
+              reason = reason,
+              referenceType = referenceType,
+              referenceId = referenceId,
+              createdBy = createdBy
+          )
+      }
+      
+      internal fun recordHistoryForAllocation(
+          transactionType: String,
+          allocatedQtyBefore: Int,
+          allocatedQtyAfter: Int,
+          reason: String? = null,
+          referenceType: String? = null,
+          referenceId: Long? = null,
+          createdBy: String
+      ) {
+          val history = InventoryHistory.create(
+              inventoryId = this.id,
+              transactionType = transactionType,
+              changeQuantity = 0,
+              beforeQuantity = _quantity,
+              afterQuantity = _quantity,
+              allocatedQtyBefore = allocatedQtyBefore,
+              allocatedQtyAfter = allocatedQtyAfter,
+              referenceType = referenceType,
+              referenceId = referenceId,
+              reason = reason,
+              createdBy = createdBy
+          )
+          _histories.add(history)
+          
+          registerEvent(InventoryHistoryRecordedEvent(
+              aggregateId = this.id,
+              inventoryId = this.id,
+              transactionType = transactionType,
+              changeQuantity = 0,
+              beforeQuantity = _quantity,
+              afterQuantity = _quantity,
+              referenceType = referenceType,
+              referenceId = referenceId,
+              reason = reason,
+              createdBy = createdBy
+          ))
+      }
+    
+     fun getHistories(): List<InventoryHistory> = _histories.toList()
 }
 
 @Converter(autoApply = true)

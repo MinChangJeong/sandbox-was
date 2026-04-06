@@ -34,6 +34,12 @@ class InventoryHistory private constructor(
     @Column(name = "after_quantity", nullable = false)
     val afterQuantity: Int,
     
+    @Column(name = "allocated_qty_before")
+    val allocatedQtyBefore: Int? = null,
+    
+    @Column(name = "allocated_qty_after")
+    val allocatedQtyAfter: Int? = null,
+    
     @Column(name = "reference_type", length = 50)
     val referenceType: String? = null,
     
@@ -43,19 +49,10 @@ class InventoryHistory private constructor(
     @Column(name = "reason", columnDefinition = "TEXT")
     val reason: String? = null,
     
-    @Column(name = "created_at", nullable = false, updatable = false)
     override val createdAt: LocalDateTime = LocalDateTime.now(),
-    
-    @Column(name = "created_by", nullable = false, updatable = false)
     override var createdBy: String = "",
-    
-    @Column(name = "updated_at", nullable = false)
     override var updatedAt: LocalDateTime = LocalDateTime.now(),
-    
-    @Column(name = "updated_by", nullable = false)
     override var updatedBy: String = "",
-    
-    @Column(name = "is_deleted", nullable = false)
     override var isDeleted: Boolean = false
 ) : BaseEntity() {
     
@@ -69,7 +66,9 @@ class InventoryHistory private constructor(
             referenceType: String? = null,
             referenceId: Long? = null,
             reason: String? = null,
-            createdBy: String
+            createdBy: String,
+            allocatedQtyBefore: Int? = null,
+            allocatedQtyAfter: Int? = null
         ): InventoryHistory {
             require(inventoryId > 0) { "재고 ID는 필수입니다" }
             require(transactionType.isNotBlank()) { "거래 유형은 필수입니다" }
@@ -79,12 +78,19 @@ class InventoryHistory private constructor(
                 "수량 계산이 맞지 않습니다: $beforeQuantity + $changeQuantity != $afterQuantity"
             }
             
+            if (allocatedQtyBefore != null && allocatedQtyAfter != null) {
+                require(allocatedQtyBefore >= 0) { "할당 전 수량은 0 이상이어야 합니다" }
+                require(allocatedQtyAfter >= 0) { "할당 후 수량은 0 이상이어야 합니다" }
+            }
+            
             return InventoryHistory(
                 inventoryId = inventoryId,
                 transactionType = transactionType,
                 changeQuantity = changeQuantity,
                 beforeQuantity = beforeQuantity,
                 afterQuantity = afterQuantity,
+                allocatedQtyBefore = allocatedQtyBefore,
+                allocatedQtyAfter = allocatedQtyAfter,
                 referenceType = referenceType,
                 referenceId = referenceId,
                 reason = reason,

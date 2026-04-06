@@ -67,26 +67,16 @@ class InventoryRepositoryAdapter(
     override fun save(inventory: Inventory): Inventory {
         val isNewEntity = inventory.id == 0L
         val saved = jpaRepository.save(mapper.toEntity(inventory))
+        val savedDomain = mapper.toDomain(saved)
         
-        if (isNewEntity && inventory.quantity > 0) {
-            recordInitialStockHistory(saved.id, inventory)
+        if (isNewEntity && savedDomain.id > 0) {
+            // ✅ 규칙 1 준수: Domain 객체의 ID가 할당된 후에야 INITIAL_STOCK 이력 기록
+            savedDomain.recordInitialStockHistory(inventory.createdBy)
         }
         
-        persistInventoryHistories(saved)
-        return mapper.toDomain(saved)
-    }
-    
-    private fun recordInitialStockHistory(inventoryId: Long, inventory: Inventory) {
-        val initialHistory = com.wms.domain.inventory.model.InventoryHistory.create(
-            inventoryId = inventoryId,
-            transactionType = "INITIAL_STOCK",
-            changeQuantity = inventory.quantity,
-            beforeQuantity = 0,
-            afterQuantity = inventory.quantity,
-            reason = "초기 재고 설정",
-            createdBy = inventory.createdBy
-        )
-        historyRepository.save(initialHistory)
+        // ✅ 재고 변경 이력 영속화 (Domain이 recordHistory()로 기록한 모든 이력)
+        persistInventoryHistories(savedDomain)
+        return savedDomain
     }
     
     private fun persistInventoryHistories(inventory: Inventory) {

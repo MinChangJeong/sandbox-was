@@ -49,3 +49,20 @@ data class InventoryMovedEvent(
     val toLocationId: Long,
     val movedQty: Int
 ) : DomainEvent
+
+data class InventoryHistoryRecordedEvent(
+    override val eventId: String = UUID.randomUUID().toString(),
+    override val occurredAt: Instant = Instant.now(),
+    override val aggregateId: Long,
+    override val aggregateType: String = "Inventory",
+    
+    val inventoryId: Long,
+    val transactionType: String,
+    val changeQuantity: Int,
+    val beforeQuantity: Int,
+    val afterQuantity: Int,
+    val referenceType: String? = null,
+    val referenceId: Long? = null,
+    val reason: String? = null,
+    val createdBy: String
+) : DomainEvent
